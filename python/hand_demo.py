@@ -55,11 +55,11 @@ class LeapNode:
         #Enables position-current control mode and the default parameters, it commands a position and then caps the current so the motors don't overload
         self.dxl_client.sync_write(motors, np.ones(len(motors))*5, 11, 1)
         self.dxl_client.set_torque_enabled(motors, True, retries=3)
-        self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kP, 84, 2) # Pgain stiffness     
-        ## self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kP * 0.75), 84, 2) # Pgain stiffness for side to side should be a bit less
+        self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kP, 84, 2) # Pgain stiffness
+        self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kP * 0.75), 84, 2) # Pgain stiffness for side to side should be a bit less
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kI, 82, 2) # Igain
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kD, 80, 2) # Dgain damping
-        ## self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kD * 0.75), 80, 2) # Dgain damping for side to side should be a bit less
+        self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kD * 0.75), 80, 2) # Dgain damping for side to side should be a bit less
         #Max at current (in unit 1ma) so don't overheat and grip too hard #500 normal or #350 for lite
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.curr_lim, 102, 2)
         self.curr_pos = self.read_pos()
@@ -123,6 +123,9 @@ def main(mode = "realtime", **kwargs):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((UDP_IP, UDP_PORT))
         print("Listening for joint angles...")
+        # Flip to -1.0 if the measured spread direction comes out mirrored on hardware
+        # (e.g. a V-gesture closes the fingers instead of spreading them).
+        ABDUCTION_GAIN = 1.0
     while True:
         #Set to an open pose and read the joint angles 33hz
         leap_hand.set_allegro(pos)
@@ -152,7 +155,27 @@ def main(mode = "realtime", **kwargs):
                     elif i == 3:  # Ring finger
                         pos[9:12] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
                     elif i == 0: # Thumb
-                        pos[13:16] = np.deg2rad([angles[base+2]*2, angles[base+2], angles[base+2]*1.0]) # copy DIP angle to PIP and DIP, and MCP for thumb
+                        # Previously copied the IP-joint (DIP-slot) angle into all three
+                        # thumb flexion motors with made-up multipliers, discarding the two
+                        # independently-tracked CMC/MCP angles entirely. Use each tracked
+                        # joint angle for its own motor instead: angles[base]/[base+1]/[base+2]
+                        # are the CMC-flex-proxy/MCP-flex/IP-flex angles (hand_joint_tracker.py's
+                        # Thumb landmark order 1,2,3,4), lined up with IDs 13/14/15
+                        # (MCP_Forward/PIP/DIP per the project's documented joint layout).
+                        # This is still an approximation -- the thumb's CMC joint does
+                        # opposition (flexion + abduction across the palm), not a simple
+                        # hinge like the other fingers' MCPs -- but it's a real per-joint
+                        # signal instead of one angle faked into three.
+                        pos[13:16] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
+                # MCP side (abduction/spread) for Index/Middle/Ring -- appended after the
+                # 12 flexion values as angles[12..14], since hand_joint_tracker.py's
+                # fingers dict (Thumb, Index, Middle, Ring) doesn't track it per-finger.
+                # Thumb's side joint (ID 12) isn't driven here -- its abduction is
+                # mechanically distinct (opposition, not spread) and isn't modeled yet.
+                if len(angles) >= 15:
+                    pos[0] = ABDUCTION_GAIN * np.deg2rad(angles[12])  # Index MCP side
+                    pos[4] = ABDUCTION_GAIN * np.deg2rad(angles[13])  # Middle MCP side
+                    pos[8] = ABDUCTION_GAIN * np.deg2rad(angles[14])  # Ring MCP side
             except Exception as e:
                 print(f"Failed to parse data: {e}")
 if __name__ == "__main__":

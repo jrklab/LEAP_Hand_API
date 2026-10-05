@@ -34,6 +34,34 @@ def map_to_motor(angle, open_deg=160, closed_deg=90, max_motor_deg=90):
     angle = np.clip(angle, closed_deg, open_deg)
     return (open_deg - angle) / (open_deg - closed_deg) * max_motor_deg
 
+def map_abduction_to_motor(angle_deg, max_input_deg=25, max_motor_deg=25):
+    """Signed linear map for finger spread (abduction/adduction), unlike map_to_motor's
+    one-sided open/closed clip -- spreading toward the thumb side vs. the pinky side are
+    opposite directions from the middle finger (the spread reference), not a single
+    open->closed range."""
+    angle_deg = np.clip(angle_deg, -max_input_deg, max_input_deg)
+    return (angle_deg / max_input_deg) * max_motor_deg
+
+def to_np(landmark):
+    return np.array([landmark.x, landmark.y, landmark.z])
+
+def signed_abduction_angle(ref_vec, finger_vec, normal):
+    """Angle (degrees, signed) of finger_vec relative to ref_vec, both projected onto the
+    palm plane defined by `normal`. Sign follows the right-hand rule around `normal`, so
+    fingers spreading to opposite sides of the reference naturally come out with opposite
+    signs -- no per-finger sign table needed."""
+    ref_proj = ref_vec - np.dot(ref_vec, normal) * normal
+    finger_proj = finger_vec - np.dot(finger_vec, normal) * normal
+    ref_norm = np.linalg.norm(ref_proj)
+    finger_norm = np.linalg.norm(finger_proj)
+    if ref_norm < 1e-8 or finger_norm < 1e-8:
+        return 0.0
+    ref_proj /= ref_norm
+    finger_proj /= finger_norm
+    cos_angle = np.clip(np.dot(ref_proj, finger_proj), -1.0, 1.0)
+    sin_angle = np.dot(normal, np.cross(ref_proj, finger_proj))
+    return np.degrees(np.arctan2(sin_angle, cos_angle))
+
 def average_landmarks(landmarks, indices):
     coords = np.mean([[landmarks[i].x, landmarks[i].y, landmarks[i].z] for i in indices], axis=0)
     palm_center = landmark_pb2.NormalizedLandmark()
@@ -65,6 +93,11 @@ ema_buffers = {
     name: [EMA(alpha=0.05) for _ in range(3)]
     for name in fingers
 }
+# Spread/abduction smoother buffers -- Index/Middle/Ring only (Thumb's abduction is
+# mechanically distinct -- opposition across the palm, not spread between fingers -- and
+# isn't modeled here; its motor side-joint is left at the existing neutral default).
+ABDUCTION_FINGERS = ['Index', 'Middle', 'Ring']
+abduction_ema = {name: EMA(alpha=0.05) for name in ABDUCTION_FINGERS}
 
 while cap.isOpened():
     success, image = cap.read()
@@ -109,6 +142,37 @@ while cap.isOpened():
 
             except Exception as e:
                 print(f"{name}: angle estimation failed: {e}")
+
+        # === Spread/abduction (MCP side-to-side) for Index/Middle/Ring ===
+        # Palm plane normal from wrist + index/ring MCPs (the three widest-spaced, most
+        # stable palm points we track); middle finger's MCP->PIP direction, projected onto
+        # that plane, is the zero-spread reference -- it reads ~0 deg by construction.
+        try:
+            wrist = to_np(landmarks[WRIST])
+            index_mcp, index_pip = to_np(landmarks[5]), to_np(landmarks[6])
+            middle_mcp, middle_pip = to_np(landmarks[9]), to_np(landmarks[10])
+            ring_mcp, ring_pip = to_np(landmarks[13]), to_np(landmarks[14])
+
+            normal = np.cross(index_mcp - wrist, ring_mcp - wrist)
+            normal /= np.linalg.norm(normal)
+            ref_vec = middle_pip - middle_mcp
+
+            finger_vecs = {
+                'Index': index_pip - index_mcp,
+                'Middle': ref_vec,
+                'Ring': ring_pip - ring_mcp,
+            }
+            abduction_angles = []
+            for name in ABDUCTION_FINGERS:
+                raw_angle = signed_abduction_angle(ref_vec, finger_vecs[name], normal)
+                smoothed = abduction_ema[name].update(raw_angle)
+                abduction_angles.append(int(map_abduction_to_motor(smoothed)))
+
+            print(f"Abduction: Index={abduction_angles[0]} Middle={abduction_angles[1]} Ring={abduction_angles[2]}")
+            smoothed_angles.extend(abduction_angles)
+        except Exception as e:
+            print(f"Abduction estimation failed: {e}")
+            smoothed_angles.extend([0, 0, 0])
 
         # === Send via UDP
         packet = ",".join(str(angle) for angle in smoothed_angles)
