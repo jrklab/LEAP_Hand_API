@@ -126,11 +126,18 @@ def main(mode = "realtime", **kwargs):
         # Flip to -1.0 if the measured spread direction comes out mirrored on hardware
         # (e.g. a V-gesture closes the fingers instead of spreading them).
         ABDUCTION_GAIN = 1.0
+    # Status prints are throttled to this many loop iterations (both modes run at ~30Hz)
+    # so the console stays readable instead of printing every single cycle.
+    PRINT_EVERY_N_LOOPS = 30
+    loop_count = 0
     while True:
+        loop_count += 1
+        verbose = (loop_count % PRINT_EVERY_N_LOOPS == 0)
         #Set to an open pose and read the joint angles 33hz
         leap_hand.set_allegro(pos)
-        print("Desired Position: " + str(pos[valid_motors]))
-        print("Read Position: " + str(leap_hand.read_pos()))
+        if verbose:
+            print("Desired Position: " + str(pos[valid_motors]))
+            print("Read Position: " + str(leap_hand.read_pos()))
         if mode == "test":
             if pos[valid_motors[0]] <= min_angle:
                 angle_step = step
@@ -142,11 +149,13 @@ def main(mode = "realtime", **kwargs):
             data, _ = sock.recvfrom(1024)
             try:
                 angles = list(map(int, data.decode().strip().split(",")))
-                print("Received angles:")
+                if verbose:
+                    print("Received angles:")
                 fingers = ['Thumb', 'Index', 'Middle', 'Ring']
                 for i, finger in enumerate(fingers):
                     base = i * 3
-                    print(f"  {finger}: MCP={angles[base]} PIP={angles[base+1]} DIP={angles[base+2]}")
+                    if verbose:
+                        print(f"  {finger}: MCP={angles[base]} PIP={angles[base+1]} DIP={angles[base+2]}")
                     # Set the position for each finger based on the received angles, and add gain for certain motor angles
                     if i == 1:  # Index finger
                         pos[1:4] = np.deg2rad([angles[base]*1.5, angles[base+1]*1, angles[base+2]*1.8])

@@ -144,10 +144,25 @@ joint_bounds = {
     for name in fingers
 }
 latest_raw_angles = {name: [None, None, None] for name in fingers}
+FINGER_ORDER = ['Thumb', 'Index', 'Middle', 'Ring']
+
+def print_joint_bounds(bounds):
+    print("--- Calibrated (open_deg, closed_deg) per joint ---")
+    for name in FINGER_ORDER:
+        mcp, pip, dip = bounds[name]
+        print(
+            f"  {name:6s}: MCP=({mcp[0]:.1f},{mcp[1]:.1f})  "
+            f"PIP=({pip[0]:.1f},{pip[1]:.1f})  DIP=({dip[0]:.1f},{dip[1]:.1f})"
+        )
+
 print(
     "Hold the hand fully OPEN and press 'o', then make a FIST and press 'c', to calibrate "
     "per-joint angle ranges (defaults used until then). Press ESC to quit."
 )
+
+# Status prints below are throttled to this many frames (~camera fps) to stay readable.
+PRINT_EVERY_N_FRAMES = 15
+frame_count = 0
 
 while cap.isOpened():
     success, image = cap.read()
@@ -163,7 +178,10 @@ while cap.isOpened():
         mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
         landmarks = hand_landmarks.landmark
-        print("\n--- Finger Angles ---")
+        frame_count += 1
+        verbose = (frame_count % PRINT_EVERY_N_FRAMES == 0)
+        if verbose:
+            print("\n--- Finger Angles ---")
         smoothed_angles = []
         now = time.time()  # shared across every joint filter this frame
 
@@ -191,7 +209,8 @@ while cap.isOpened():
 
                 smoothed_angles.extend([mcp_mapped, pip_mapped, dip_mapped])
 
-                print(f"{name}: MCP={mcp_mapped}°, PIP={pip_mapped}°, DIP={dip_mapped}°")
+                if verbose:
+                    print(f"{name}: MCP={mcp_mapped}°, PIP={pip_mapped}°, DIP={dip_mapped}°")
 
             except Exception as e:
                 print(f"{name}: angle estimation failed: {e}")
@@ -221,7 +240,8 @@ while cap.isOpened():
                 smoothed = abduction_filters[name].update(raw_angle, now)
                 abduction_angles.append(int(map_abduction_to_motor(smoothed)))
 
-            print(f"Abduction: Index={abduction_angles[0]} Middle={abduction_angles[1]} Ring={abduction_angles[2]}")
+            if verbose:
+                print(f"Abduction: Index={abduction_angles[0]} Middle={abduction_angles[1]} Ring={abduction_angles[2]}")
             smoothed_angles.extend(abduction_angles)
         except Exception as e:
             print(f"Abduction estimation failed: {e}")
@@ -238,19 +258,23 @@ while cap.isOpened():
     elif key == ord('o') or key == ord('c'):
         bound_index = 0 if key == ord('o') else 1  # [open, closed]
         label = "OPEN" if key == ord('o') else "CLOSED"
-        for name in fingers:
-            for j in range(3):
-                angle = latest_raw_angles[name][j]
-                if angle is not None:
-                    joint_bounds[name][j][bound_index] = angle
-        # Guard against a joint whose two captured poses came out reversed (e.g. 'o' and
-        # 'c' pressed in the wrong order) -- map_to_motor assumes open_deg >= closed_deg.
-        for name in fingers:
-            for j in range(3):
-                open_deg, closed_deg = joint_bounds[name][j]
-                if open_deg < closed_deg:
-                    joint_bounds[name][j] = [closed_deg, open_deg]
-        print(f"Captured {label} bounds: {joint_bounds}")
+        if all(latest_raw_angles[name][j] is None for name in fingers for j in range(3)):
+            print(f"No hand detected -- '{label}' capture ignored, show your hand to the camera first.")
+        else:
+            for name in fingers:
+                for j in range(3):
+                    angle = latest_raw_angles[name][j]
+                    if angle is not None:
+                        joint_bounds[name][j][bound_index] = angle
+            # Guard against a joint whose two captured poses came out reversed (e.g. 'o' and
+            # 'c' pressed in the wrong order) -- map_to_motor assumes open_deg >= closed_deg.
+            for name in fingers:
+                for j in range(3):
+                    open_deg, closed_deg = joint_bounds[name][j]
+                    if open_deg < closed_deg:
+                        joint_bounds[name][j] = [closed_deg, open_deg]
+            print(f"\n*** Captured {label} pose ***")
+            print_joint_bounds(joint_bounds)
 
 cap.release()
 cv2.destroyAllWindows()
