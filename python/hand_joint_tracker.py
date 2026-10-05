@@ -129,6 +129,26 @@ joint_filters = {
 ABDUCTION_FINGERS = ['Index', 'Middle', 'Ring']
 abduction_filters = {name: OneEuroFilter(mincutoff=1.0, beta=0.3) for name in ABDUCTION_FINGERS}
 
+# Per-joint (open_deg, closed_deg) bounds for map_to_motor. A single generic (160, 90)
+# window doesn't fit every joint -- e.g. the thumb's CMC/MCP joints have a visibly smaller
+# raw-angle swing than finger PIP/DIP joints, so with the generic window they may never
+# read low enough to leave the "open" end of the motor range regardless of pose, while the
+# joint whose real range happens to overlap the window moves normally. Rather than guess
+# per-joint numbers, capture them live: hold the hand fully OPEN and press 'o', then make a
+# FIST and press 'c' -- this records each joint's own true extremes for this hand/session.
+# Defaults below are only a fallback until you calibrate.
+DEFAULT_OPEN_DEG = 160.0
+DEFAULT_CLOSED_DEG = 90.0
+joint_bounds = {
+    name: [[DEFAULT_OPEN_DEG, DEFAULT_CLOSED_DEG] for _ in range(3)]
+    for name in fingers
+}
+latest_raw_angles = {name: [None, None, None] for name in fingers}
+print(
+    "Hold the hand fully OPEN and press 'o', then make a FIST and press 'c', to calibrate "
+    "per-joint angle ranges (defaults used until then). Press ESC to quit."
+)
+
 while cap.isOpened():
     success, image = cap.read()
     if not success:
@@ -162,10 +182,12 @@ while cap.isOpened():
                 mcp_angle = joint_filters[name][0].update(get_angle(wrist, mcp, pip), now)
                 pip_angle = joint_filters[name][1].update(get_angle(mcp, pip, dip), now)
                 dip_angle = joint_filters[name][2].update(get_angle(pip, dip, tip), now)
+                latest_raw_angles[name] = [mcp_angle, pip_angle, dip_angle]
 
-                mcp_mapped = int(map_to_motor(mcp_angle))
-                pip_mapped = int(map_to_motor(pip_angle))
-                dip_mapped = int(map_to_motor(dip_angle))
+                (mcp_open, mcp_closed), (pip_open, pip_closed), (dip_open, dip_closed) = joint_bounds[name]
+                mcp_mapped = int(map_to_motor(mcp_angle, open_deg=mcp_open, closed_deg=mcp_closed))
+                pip_mapped = int(map_to_motor(pip_angle, open_deg=pip_open, closed_deg=pip_closed))
+                dip_mapped = int(map_to_motor(dip_angle, open_deg=dip_open, closed_deg=dip_closed))
 
                 smoothed_angles.extend([mcp_mapped, pip_mapped, dip_mapped])
 
@@ -210,8 +232,25 @@ while cap.isOpened():
         sock.sendto(packet.encode(), (UDP_IP, UDP_PORT))
 
     cv2.imshow("Hand Tracking", image)
-    if cv2.waitKey(1) & 0xFF == 27:
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
         break
+    elif key == ord('o') or key == ord('c'):
+        bound_index = 0 if key == ord('o') else 1  # [open, closed]
+        label = "OPEN" if key == ord('o') else "CLOSED"
+        for name in fingers:
+            for j in range(3):
+                angle = latest_raw_angles[name][j]
+                if angle is not None:
+                    joint_bounds[name][j][bound_index] = angle
+        # Guard against a joint whose two captured poses came out reversed (e.g. 'o' and
+        # 'c' pressed in the wrong order) -- map_to_motor assumes open_deg >= closed_deg.
+        for name in fingers:
+            for j in range(3):
+                open_deg, closed_deg = joint_bounds[name][j]
+                if open_deg < closed_deg:
+                    joint_bounds[name][j] = [closed_deg, open_deg]
+        print(f"Captured {label} bounds: {joint_bounds}")
 
 cap.release()
 cv2.destroyAllWindows()
