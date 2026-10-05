@@ -4,6 +4,7 @@ from leap_hand_utils.dynamixel_client import *
 import leap_hand_utils.leap_hand_utils as lhu
 import time
 import socket
+import threading
 #######################################################
 """This can control and query the LEAP Hand
 
@@ -22,6 +23,15 @@ I recommend you only query when necessary and below 90 samples a second.  Used t
 
 """
 ########################################################
+
+def slew_limit(current, target, max_step):
+    """Clamp how far `current` can move toward `target` in one control step, so a single
+    noisy/garbled UDP packet (or a vision-side glitch) can't produce an instantaneous large
+    jump in commanded position -- same idea as the 32-step init ramp in LeapNode.__init__,
+    applied continuously instead of once at startup."""
+    delta = np.clip(target - current, -max_step, max_step)
+    return current + delta
+
 class LeapNode:
     def __init__(self, motors=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]):
         ####Some parameters
@@ -116,6 +126,7 @@ def main(mode = "realtime", **kwargs):
         angle_step = step  # 5 degrees in radians
         max_angle = np.deg2rad(60)  # 90 degrees in radians
         min_angle = np.deg2rad(0)  # -90 degrees in radians
+        PRINT_EVERY_N_LOOPS = 33  # ~once/second at this mode's 0.03s loop period
     elif mode == "realtime": # need to run hand_joint_tracker.py to send UDP packets with joint angles
         # listen for UDP messages
         UDP_IP = "0.0.0.0"
@@ -126,12 +137,77 @@ def main(mode = "realtime", **kwargs):
         # Flip to -1.0 if the measured spread direction comes out mirrored on hardware
         # (e.g. a V-gesture closes the fingers instead of spreading them).
         ABDUCTION_GAIN = 1.0
-    # Status prints are throttled to this many loop iterations (both modes run at ~30Hz)
-    # so the console stays readable instead of printing every single cycle.
-    PRINT_EVERY_N_LOOPS = 30
+
+        # Decouple the motor control rate from the vision/UDP rate -- the camera +
+        # MediaPipe inference loop runs irregularly and can hiccup, and previously
+        # recvfrom() blocked the control loop directly on it, so a slow vision frame left
+        # the motors holding a stale command until the next packet, then jumping straight
+        # to the new one. A background thread just keeps target_pos updated with whatever
+        # arrived most recently; the control loop below runs at its own fixed pace and
+        # slews toward it (see slew_limit above), so gaps/glitches on the vision side no
+        # longer directly show up as jerky motor motion.
+        target_pos = pos.copy()
+        target_lock = threading.Lock()
+
+        def udp_listener():
+            finger_names = ['Thumb', 'Index', 'Middle', 'Ring']
+            while True:
+                data, _ = sock.recvfrom(1024)
+                try:
+                    angles = list(map(int, data.decode().strip().split(",")))
+                    new_target = target_pos.copy()
+                    for i, finger in enumerate(finger_names):
+                        base = i * 3
+                        # Set the position for each finger based on the received angles, and add gain for certain motor angles
+                        if i == 1:  # Index finger
+                            new_target[1:4] = np.deg2rad([angles[base]*1.5, angles[base+1]*1, angles[base+2]*1.8])
+                        elif i == 2:  # Middle finger
+                            new_target[5:8] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
+                        elif i == 3:  # Ring finger
+                            new_target[9:12] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
+                        elif i == 0:  # Thumb
+                            # Previously copied the IP-joint (DIP-slot) angle into all three
+                            # thumb flexion motors with made-up multipliers, discarding the
+                            # two independently-tracked CMC/MCP angles entirely. Use each
+                            # tracked joint angle for its own motor instead:
+                            # angles[base]/[base+1]/[base+2] are the CMC-flex-proxy/MCP-flex/
+                            # IP-flex angles (hand_joint_tracker.py's Thumb landmark order
+                            # 1,2,3,4), lined up with IDs 13/14/15 (MCP_Forward/PIP/DIP per
+                            # the project's documented joint layout). This is still an
+                            # approximation -- the thumb's CMC joint does opposition
+                            # (flexion + abduction across the palm), not a simple hinge like
+                            # the other fingers' MCPs -- but it's a real per-joint signal
+                            # instead of one angle faked into three.
+                            new_target[13:16] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
+                    # MCP side (abduction/spread) for Index/Middle/Ring -- appended after the
+                    # 12 flexion values as angles[12..14], since hand_joint_tracker.py's
+                    # fingers dict (Thumb, Index, Middle, Ring) doesn't track it per-finger.
+                    # Thumb's side joint (ID 12) isn't driven here -- its abduction is
+                    # mechanically distinct (opposition, not spread) and isn't modeled yet.
+                    if len(angles) >= 15:
+                        new_target[0] = ABDUCTION_GAIN * np.deg2rad(angles[12])  # Index MCP side
+                        new_target[4] = ABDUCTION_GAIN * np.deg2rad(angles[13])  # Middle MCP side
+                        new_target[8] = ABDUCTION_GAIN * np.deg2rad(angles[14])  # Ring MCP side
+                    with target_lock:
+                        target_pos[:] = new_target
+                except Exception as e:
+                    print(f"Failed to parse data: {e}")
+
+        threading.Thread(target=udp_listener, daemon=True).start()
+
+        CONTROL_PERIOD_S = 0.01  # fixed 100Hz control loop, independent of UDP arrival rate
+        # Caps how fast a commanded position can change per second -- generous enough not
+        # to feel laggy for real gesture motion, but enough to absorb an isolated noisy or
+        # garbled packet instead of jerking the motor straight to it.
+        MAX_SLEW_RAD_PER_S = np.deg2rad(400)
+        max_step = MAX_SLEW_RAD_PER_S * CONTROL_PERIOD_S
+        PRINT_EVERY_N_LOOPS = 100  # ~once/second at this mode's 100Hz loop rate
+
     loop_count = 0
     while True:
         loop_count += 1
+        # Status prints are throttled so the console stays readable instead of printing
+        # every single cycle.
         verbose = (loop_count % PRINT_EVERY_N_LOOPS == 0)
         #Set to an open pose and read the joint angles 33hz
         leap_hand.set_allegro(pos)
@@ -146,47 +222,10 @@ def main(mode = "realtime", **kwargs):
             pos[valid_motors] += angle_step
             time.sleep(0.03)
         elif mode == "realtime":
-            data, _ = sock.recvfrom(1024)
-            try:
-                angles = list(map(int, data.decode().strip().split(",")))
-                if verbose:
-                    print("Received angles:")
-                fingers = ['Thumb', 'Index', 'Middle', 'Ring']
-                for i, finger in enumerate(fingers):
-                    base = i * 3
-                    if verbose:
-                        print(f"  {finger}: MCP={angles[base]} PIP={angles[base+1]} DIP={angles[base+2]}")
-                    # Set the position for each finger based on the received angles, and add gain for certain motor angles
-                    if i == 1:  # Index finger
-                        pos[1:4] = np.deg2rad([angles[base]*1.5, angles[base+1]*1, angles[base+2]*1.8])
-                    elif i == 2:  # Middle finger
-                        pos[5:8] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
-                    elif i == 3:  # Ring finger
-                        pos[9:12] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
-                    elif i == 0: # Thumb
-                        # Previously copied the IP-joint (DIP-slot) angle into all three
-                        # thumb flexion motors with made-up multipliers, discarding the two
-                        # independently-tracked CMC/MCP angles entirely. Use each tracked
-                        # joint angle for its own motor instead: angles[base]/[base+1]/[base+2]
-                        # are the CMC-flex-proxy/MCP-flex/IP-flex angles (hand_joint_tracker.py's
-                        # Thumb landmark order 1,2,3,4), lined up with IDs 13/14/15
-                        # (MCP_Forward/PIP/DIP per the project's documented joint layout).
-                        # This is still an approximation -- the thumb's CMC joint does
-                        # opposition (flexion + abduction across the palm), not a simple
-                        # hinge like the other fingers' MCPs -- but it's a real per-joint
-                        # signal instead of one angle faked into three.
-                        pos[13:16] = np.deg2rad([angles[base], angles[base+1], angles[base+2]])
-                # MCP side (abduction/spread) for Index/Middle/Ring -- appended after the
-                # 12 flexion values as angles[12..14], since hand_joint_tracker.py's
-                # fingers dict (Thumb, Index, Middle, Ring) doesn't track it per-finger.
-                # Thumb's side joint (ID 12) isn't driven here -- its abduction is
-                # mechanically distinct (opposition, not spread) and isn't modeled yet.
-                if len(angles) >= 15:
-                    pos[0] = ABDUCTION_GAIN * np.deg2rad(angles[12])  # Index MCP side
-                    pos[4] = ABDUCTION_GAIN * np.deg2rad(angles[13])  # Middle MCP side
-                    pos[8] = ABDUCTION_GAIN * np.deg2rad(angles[14])  # Ring MCP side
-            except Exception as e:
-                print(f"Failed to parse data: {e}")
+            with target_lock:
+                target = target_pos.copy()
+            pos = slew_limit(pos, target, max_step)
+            time.sleep(CONTROL_PERIOD_S)
 if __name__ == "__main__":
     import argparse
 
