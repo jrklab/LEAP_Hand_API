@@ -119,8 +119,20 @@ WRIST = 0
 # === Smoother Buffers: 4 fingers × 3 joints
 # mincutoff/beta are starting points (same shape as the One Euro paper's own defaults) --
 # raise beta if fast gestures still feel laggy, lower mincutoff if a held pose still jitters.
+#
+# Thumb gets its own, more aggressive, settings: its "MCP" angle is computed using the
+# wrist as a stand-in vertex (the other fingers use a real adjacent joint), and the thumb
+# moves more through the camera's depth (z) axis, which MediaPipe tracks less reliably than
+# x/y -- both make its raw angle noisier than the other fingers', so it's smoothed harder
+# (lower mincutoff/beta/dcutoff) at the cost of a bit more lag.
+FILTER_PARAMS = {
+    'Thumb':  {'mincutoff': 0.3, 'beta': 0.1, 'dcutoff': 0.5},
+    'Index':  {'mincutoff': 1.0, 'beta': 0.3, 'dcutoff': 1.0},
+    'Middle': {'mincutoff': 1.0, 'beta': 0.3, 'dcutoff': 1.0},
+    'Ring':   {'mincutoff': 1.0, 'beta': 0.3, 'dcutoff': 1.0},
+}
 joint_filters = {
-    name: [OneEuroFilter(mincutoff=1.0, beta=0.3) for _ in range(3)]
+    name: [OneEuroFilter(**FILTER_PARAMS[name]) for _ in range(3)]
     for name in fingers
 }
 # Spread/abduction smoother buffers -- Index/Middle/Ring only (Thumb's abduction is
