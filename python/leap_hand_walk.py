@@ -51,8 +51,12 @@ LEG_ORDER = ['Index', 'Middle', 'Ring']  # wave-gait phase offset follows this o
 
 # All angles below are in the "allegro" convention already used throughout this repo:
 # 0 roughly "neutral/open", positive = curling further closed. See leap_hand_utils.py.
-HIP_MIN_DEG = 15.0      # fully "reaching forward" (start of stance / end of swing)
-HIP_MAX_DEG = 65.0      # fully "curled back" (end of stance / start of swing)
+# Camera footage showed real lift-off but zero net body translation cycle-over-cycle --
+# the hip sweep (50deg) was likely too short to generate meaningful stride length.
+# MCP_Forward's real range is -18/+128deg; widened the sweep to use most of it, keeping
+# ~13-18deg margin on each end.
+HIP_MIN_DEG = -5.0      # fully "reaching forward" (start of stance / end of swing)
+HIP_MAX_DEG = 110.0     # fully "curled back" (end of stance / start of swing)
 KNEE_STANCE_DEG = 10.0  # extended, foot planted
 KNEE_SWING_DEG = 55.0   # flexed, foot lifted
 ANKLE_DEG = 20.0        # fixed DIP curl, not actively cycled
