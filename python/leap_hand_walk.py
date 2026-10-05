@@ -12,9 +12,11 @@ Per leg, two joints do the work (all angles in the "allegro" convention already 
 throughout this repo: 0 roughly "neutral/open", positive = curling further closed -- see
 leap_hand_utils.py):
   - MCP_Forward ("hip"): sweeps the whole finger fore/aft. During stance this sweeps
-    slowly from "reaching forward" to "curled back", dragging the body forward over the
-    planted fingertip (the same principle as a real leg's stance-phase retraction).
-    During swing it resets quickly back to "reaching forward".
+    slowly from "curled back" to "reaching forward", dragging the body forward over the
+    planted fingertip. (The opposite sweep direction was tried first by analogy to a
+    normal leg's stance-phase retraction, but empirically drove the hand backward --
+    reversed here based on that result, not re-derived from theory.) During swing it
+    resets quickly back to "curled back".
   - PIP ("knee"): held extended (foot down) during stance, lifts briefly during swing so
     the fingertip clears the ground while the hip resets.
 MCP_Side is held neutral (no splay) and DIP is held at a fixed curl ("ankle") -- both
@@ -75,28 +77,43 @@ def _ease(s):
     return (1 - math.cos(math.pi * s)) / 2
 
 
-def leg_trajectory_deg(phase):
+def leg_trajectory_deg(phase, reverse=False):
     """phase in [0, 1), wraps automatically. Returns (hip_deg, knee_deg) for one leg at
-    this point in its own gait cycle."""
+    this point in its own gait cycle.
+
+    reverse=False (default, drives the hand forward): stance sweeps MAX->MIN, swing
+    resets MIN->MAX -- empirically confirmed direction, not derived from theory (the
+    opposite convention was tried first and drove the hand backward).
+    reverse=True: stance sweeps MIN->MAX instead, for backward motion."""
+    hip_stance_start, hip_stance_end = (HIP_MIN_DEG, HIP_MAX_DEG) if reverse else (HIP_MAX_DEG, HIP_MIN_DEG)
     phase = phase % 1.0
     if phase < DUTY_FACTOR:
         s = phase / DUTY_FACTOR
-        hip = HIP_MIN_DEG + _ease(s) * (HIP_MAX_DEG - HIP_MIN_DEG)
+        hip = hip_stance_start + _ease(s) * (hip_stance_end - hip_stance_start)
         knee = KNEE_STANCE_DEG
     else:
         s = (phase - DUTY_FACTOR) / (1 - DUTY_FACTOR)
-        hip = HIP_MAX_DEG + _ease(s) * (HIP_MIN_DEG - HIP_MAX_DEG)
+        hip = hip_stance_end + _ease(s) * (hip_stance_start - hip_stance_end)
         knee = KNEE_STANCE_DEG + (KNEE_SWING_DEG - KNEE_STANCE_DEG) * math.sin(math.pi * s)
     return hip, knee
 
 
-def build_pose_deg(global_phase):
-    """Full 16-element allegro-convention pose (degrees) for one instant of the gait."""
+def build_pose_deg(global_phase, synchronized=False, reverse=False):
+    """Full 16-element allegro-convention pose (degrees) for one instant of the gait.
+
+    synchronized=False (default): wave gait -- legs phase-offset by 1/3 of a cycle, so
+    exactly one leg swings at a time and the hand always has >=2 feet (+thumb) down.
+    synchronized=True: all three legs move in lockstep -- stance together (3x the
+    simultaneous propulsive force of the wave gait's at-most-2-legs-pushing) and swing
+    together (briefly resting on just the thumb while all three reset). Worth trying if
+    the wave gait's staggered, smaller per-instant thrust isn't enough to overcome
+    whatever's resisting the palm, at the cost of a less stable swing moment.
+    """
     pose = np.zeros(16)
     pose[12:16] = THUMB_POSE_DEG
     for i, name in enumerate(LEG_ORDER):
-        leg_phase = global_phase + i / len(LEG_ORDER)
-        hip_deg, knee_deg = leg_trajectory_deg(leg_phase)
+        leg_phase = global_phase if synchronized else global_phase + i / len(LEG_ORDER)
+        hip_deg, knee_deg = leg_trajectory_deg(leg_phase, reverse=reverse)
         pose[LEG_FINGER_SLICES[name]] = [0.0, hip_deg, knee_deg, ANKLE_DEG]
     return pose
 
@@ -107,7 +124,7 @@ def _to_real_radians(pose_deg):
     return lhu.angle_safety_clip(lhu.allegro_to_LEAPhand(np.deg2rad(pose_deg), zeros=False))
 
 
-def run(leap_hand, cycle_period_s, num_cycles, control_hz=50):
+def run(leap_hand, cycle_period_s, num_cycles, control_hz=50, synchronized=False, reverse=False):
     control_period_s = 1.0 / control_hz
     max_step = np.deg2rad(MAX_SLEW_DEG_PER_S) * control_period_s
     pos = leap_hand.curr_pos.copy()
@@ -115,7 +132,7 @@ def run(leap_hand, cycle_period_s, num_cycles, control_hz=50):
     duration_s = cycle_period_s * num_cycles if num_cycles else None
     while duration_s is None or time.time() - t0 < duration_s:
         global_phase = ((time.time() - t0) / cycle_period_s) % 1.0
-        target = _to_real_radians(build_pose_deg(global_phase))
+        target = _to_real_radians(build_pose_deg(global_phase, synchronized=synchronized, reverse=reverse))
         pos = slew_limit(pos, target, max_step)
         leap_hand.set_leap(pos)
         time.sleep(control_period_s)
@@ -226,6 +243,12 @@ if __name__ == "__main__":
     parser.add_argument("--cycle-period", type=float, default=3.0,
                         help="Seconds per full gait cycle (slower = safer to watch).")
     parser.add_argument("--cycles", type=int, default=4, help="Number of cycles to run, 0 = run until Ctrl-C.")
+    parser.add_argument("--sync", action="store_true",
+                        help="In --mode walk, move all three legs in lockstep (stance/swing together) instead "
+                             "of the default staggered wave gait -- trades continuous ground support for 3x "
+                             "the simultaneous propulsive force.")
+    parser.add_argument("--reverse", action="store_true",
+                        help="In --mode walk, drive the hand backward instead of forward.")
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Seconds to hold the pose in --mode thumb-pose, or to print in --mode thumb-capture "
                              "(0 = until Ctrl-C).")
@@ -248,6 +271,6 @@ if __name__ == "__main__":
         elif args.mode == "thumb-capture":
             capture_thumb_pose(leap_hand, args.duration)
         else:
-            run(leap_hand, args.cycle_period, args.cycles)
+            run(leap_hand, args.cycle_period, args.cycles, synchronized=args.sync, reverse=args.reverse)
     except KeyboardInterrupt:
         pass
