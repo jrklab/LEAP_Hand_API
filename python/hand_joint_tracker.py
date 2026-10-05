@@ -3,23 +3,51 @@ import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import socket
+import time
 
 # === UDP Setup ===
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-class EMA:
-    def __init__(self, alpha=0.5):
-        self.alpha = alpha
-        self.value = None
+class OneEuroFilter:
+    """Adaptive low-pass filter (Casiez et al. 2012): applies heavy smoothing when the
+    signal is nearly still (killing jitter) and light smoothing when it's moving fast
+    (killing lag), instead of a fixed-alpha EMA's constant lag/noise tradeoff regardless of
+    speed -- useful here since a fast gesture and a held pose have very different noise
+    characteristics from the same landmark estimator.
+    """
+    def __init__(self, freq=30.0, mincutoff=1.0, beta=0.0, dcutoff=1.0):
+        self.freq = freq
+        self.mincutoff = mincutoff
+        self.beta = beta
+        self.dcutoff = dcutoff
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
 
-    def update(self, new_value):
-        if self.value is None:
-            self.value = new_value
-        else:
-            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
-        return self.value
+    def _alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / te)
+
+    def update(self, x, timestamp=None):
+        if self.x_prev is None:
+            self.x_prev = x
+            self.t_prev = timestamp
+            return x
+        if timestamp is not None and self.t_prev is not None and timestamp > self.t_prev:
+            self.freq = 1.0 / (timestamp - self.t_prev)
+        dx = (x - self.x_prev) * self.freq
+        a_d = self._alpha(self.dcutoff)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        cutoff = self.mincutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff)
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = timestamp
+        return x_hat
 
 # === Angle Utilities ===
 def get_angle(p1, p2, p3):
@@ -89,15 +117,17 @@ fingers = {
 WRIST = 0
 
 # === Smoother Buffers: 4 fingers × 3 joints
-ema_buffers = {
-    name: [EMA(alpha=0.05) for _ in range(3)]
+# mincutoff/beta are starting points (same shape as the One Euro paper's own defaults) --
+# raise beta if fast gestures still feel laggy, lower mincutoff if a held pose still jitters.
+joint_filters = {
+    name: [OneEuroFilter(mincutoff=1.0, beta=0.3) for _ in range(3)]
     for name in fingers
 }
 # Spread/abduction smoother buffers -- Index/Middle/Ring only (Thumb's abduction is
 # mechanically distinct -- opposition across the palm, not spread between fingers -- and
 # isn't modeled here; its motor side-joint is left at the existing neutral default).
 ABDUCTION_FINGERS = ['Index', 'Middle', 'Ring']
-abduction_ema = {name: EMA(alpha=0.05) for name in ABDUCTION_FINGERS}
+abduction_filters = {name: OneEuroFilter(mincutoff=1.0, beta=0.3) for name in ABDUCTION_FINGERS}
 
 while cap.isOpened():
     success, image = cap.read()
@@ -115,6 +145,7 @@ while cap.isOpened():
         landmarks = hand_landmarks.landmark
         print("\n--- Finger Angles ---")
         smoothed_angles = []
+        now = time.time()  # shared across every joint filter this frame
 
         for name, ids in fingers.items():
             try:
@@ -128,9 +159,9 @@ while cap.isOpened():
                 dip = landmarks[ids[2]]
                 tip = landmarks[ids[3]]
 
-                mcp_angle = ema_buffers[name][0].update(get_angle(wrist, mcp, pip))
-                pip_angle = ema_buffers[name][1].update(get_angle(mcp, pip, dip))
-                dip_angle = ema_buffers[name][2].update(get_angle(pip, dip, tip))
+                mcp_angle = joint_filters[name][0].update(get_angle(wrist, mcp, pip), now)
+                pip_angle = joint_filters[name][1].update(get_angle(mcp, pip, dip), now)
+                dip_angle = joint_filters[name][2].update(get_angle(pip, dip, tip), now)
 
                 mcp_mapped = int(map_to_motor(mcp_angle))
                 pip_mapped = int(map_to_motor(pip_angle))
@@ -165,7 +196,7 @@ while cap.isOpened():
             abduction_angles = []
             for name in ABDUCTION_FINGERS:
                 raw_angle = signed_abduction_angle(ref_vec, finger_vecs[name], normal)
-                smoothed = abduction_ema[name].update(raw_angle)
+                smoothed = abduction_filters[name].update(raw_angle, now)
                 abduction_angles.append(int(map_abduction_to_motor(smoothed)))
 
             print(f"Abduction: Index={abduction_angles[0]} Middle={abduction_angles[1]} Ring={abduction_angles[2]}")
