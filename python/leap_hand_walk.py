@@ -50,6 +50,7 @@ LEG_FINGER_SLICES = {
     'Ring': slice(8, 12),
 }
 LEG_ORDER = ['Index', 'Middle', 'Ring']  # wave-gait phase offset follows this order
+THUMB_MOTORS = [12, 13, 14, 15]
 
 # All angles below are in the "allegro" convention already used throughout this repo:
 # 0 roughly "neutral/open", positive = curling further closed. See leap_hand_utils.py.
@@ -62,10 +63,12 @@ HIP_MAX_DEG = 110.0     # fully "curled back" (end of stance / start of swing)
 KNEE_STANCE_DEG = 10.0  # extended, foot planted
 KNEE_SWING_DEG = 55.0   # flexed, foot lifted
 ANKLE_DEG = 20.0        # fixed DIP curl, not actively cycled
-# Fixed "kickstand" pose: Side,Forward,PIP,DIP. Captured by disabling thumb torque
-# (--mode thumb-capture) and manually posing the thumb for ground support, then reading
-# back its settled joint angles -- not a geometric guess.
-THUMB_POSE_DEG = [99.8, -7.4, 8.3, -5.5]
+# Fixed "kickstand" pose: Side,Forward,PIP,DIP. Captured with --mode walk --free-thumb
+# (thumb torque disabled while Index/Middle/Ring actually walked) then reading back its
+# held position -- used as-is (0deg extra margin, per explicit confirmation this exact
+# position has been verified). PIP sits ~6.5deg past its documented joint limit;
+# angle_safety_clip will still clamp it there regardless of this constant.
+THUMB_POSE_DEG = [91.1, -23.5, -75.3, -68.5]
 
 DUTY_FACTOR = 2.0 / 3.0  # fraction of each leg's cycle spent in stance
 MAX_SLEW_DEG_PER_S = 400.0  # safety backstop only -- the trajectory itself is already smooth
@@ -124,18 +127,80 @@ def _to_real_radians(pose_deg):
     return lhu.angle_safety_clip(lhu.allegro_to_LEAPhand(np.deg2rad(pose_deg), zeros=False))
 
 
-def run(leap_hand, cycle_period_s, num_cycles, control_hz=50, synchronized=False, reverse=False):
+def _resilient_call(leap_hand, fn, *args, **kwargs):
+    """Call fn(*args, **kwargs) (a hardware I/O call through leap_hand), and on the same
+    transient communication fault hand_demo.py's realtime loop recovers from (a
+    RuntimeError/termios-style error from deep inside a sync read/write -- see
+    DynamixelClient.reconnect()'s docstring), reconnect the port and retry once instead of
+    crashing the whole script. Returns None if the retry also fails -- callers should
+    treat that as "skip this cycle", not a terminal error."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f"Communication error ({e!r}) -- attempting to reconnect...")
+        try:
+            leap_hand.dxl_client.reconnect()
+            print("Reconnected.")
+        except Exception as reconnect_error:
+            print(f"Reconnect failed ({reconnect_error!r}).")
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e2:
+            print(f"Still failing after reconnect ({e2!r}), skipping this cycle.")
+            return None
+
+
+def run(leap_hand, cycle_period_s, num_cycles, control_hz=50, synchronized=False, reverse=False, free_thumb=False):
+    """free_thumb=True disables torque on all 4 thumb motors for the duration of the walk
+    (re-enabled in a finally block, same safety pattern as capture_thumb_pose) so you can
+    feel out a support pose by hand while Index/Middle/Ring are actually walking, instead
+    of only in the static stance pose capture_thumb_pose/thumb-capture holds. Thumb angles
+    are printed once a second while free."""
     control_period_s = 1.0 / control_hz
     max_step = np.deg2rad(MAX_SLEW_DEG_PER_S) * control_period_s
     pos = leap_hand.curr_pos.copy()
     t0 = time.time()
     duration_s = cycle_period_s * num_cycles if num_cycles else None
-    while duration_s is None or time.time() - t0 < duration_s:
-        global_phase = ((time.time() - t0) / cycle_period_s) % 1.0
-        target = _to_real_radians(build_pose_deg(global_phase, synchronized=synchronized, reverse=reverse))
-        pos = slew_limit(pos, target, max_step)
-        leap_hand.set_leap(pos)
-        time.sleep(control_period_s)
+
+    if free_thumb:
+        leap_hand.dxl_client.set_torque_enabled(THUMB_MOTORS, False)
+        print("Thumb torque disabled for this walk -- move it by hand; "
+              "printing its angles once a second (Ctrl-C to stop).")
+    try:
+        last_print = 0.0
+        while duration_s is None or time.time() - t0 < duration_s:
+            global_phase = ((time.time() - t0) / cycle_period_s) % 1.0
+            target = _to_real_radians(build_pose_deg(global_phase, synchronized=synchronized, reverse=reverse))
+            if free_thumb:
+                # Torque is off, so the thumb's Goal_Position is cosmetic during the loop
+                # -- but keep it pinned at whatever it already is rather than letting
+                # slew_limit keep chasing THUMB_POSE_DEG underneath it, so there's no
+                # stale target for it to snap toward the instant torque comes back below.
+                target[12:16] = pos[12:16]
+            pos = slew_limit(pos, target, max_step)
+            _resilient_call(leap_hand, leap_hand.set_leap, pos)
+            if free_thumb:
+                now = time.time()
+                if now - last_print >= 1.0:
+                    current_real = _resilient_call(leap_hand, leap_hand.read_pos)
+                    if current_real is not None:
+                        thumb_deg = np.degrees(lhu.LEAPhand_to_allegro(current_real, zeros=False))[12:16]
+                        print(f"Thumb pose (deg): Side={thumb_deg[0]:.1f}  Forward={thumb_deg[1]:.1f}  "
+                              f"PIP={thumb_deg[2]:.1f}  DIP={thumb_deg[3]:.1f}")
+                    last_print = now
+            time.sleep(control_period_s)
+    finally:
+        if free_thumb:
+            # Snap the commanded thumb target to wherever it's actually resting right now
+            # before re-enabling torque, so it holds that pose instead of jumping toward
+            # whatever was last commanded before torque was disabled.
+            current_real = _resilient_call(leap_hand, leap_hand.read_pos)
+            if current_real is not None:
+                pos[12:16] = current_real[12:16]
+                _resilient_call(leap_hand, leap_hand.set_leap, pos)
+            leap_hand.dxl_client.set_torque_enabled(THUMB_MOTORS, True)
+            print("Thumb torque re-enabled.")
 
 
 def run_single_leg(leap_hand, finger, cycle_period_s, num_cycles, control_hz=50):
@@ -160,7 +225,7 @@ def run_single_leg(leap_hand, finger, cycle_period_s, num_cycles, control_hz=50)
             pose_deg[LEG_FINGER_SLICES[name]] = [0.0, hip_deg, knee_deg, ANKLE_DEG]
         target = _to_real_radians(pose_deg)
         pos = slew_limit(pos, target, max_step)
-        leap_hand.set_leap(pos)
+        _resilient_call(leap_hand, leap_hand.set_leap, pos)
         time.sleep(control_period_s)
 
 
@@ -178,11 +243,8 @@ def hold_thumb_pose(leap_hand, duration_s, control_hz=50):
     t0 = time.time()
     while time.time() - t0 < duration_s:
         pos = slew_limit(pos, target, max_step)
-        leap_hand.set_leap(pos)
+        _resilient_call(leap_hand, leap_hand.set_leap, pos)
         time.sleep(control_period_s)
-
-
-THUMB_MOTORS = [12, 13, 14, 15]
 
 
 def capture_thumb_pose(leap_hand, duration_s, control_hz=20):
@@ -205,7 +267,7 @@ def capture_thumb_pose(leap_hand, duration_s, control_hz=20):
     t0 = time.time()
     while time.time() - t0 < 1.5:
         pos = slew_limit(pos, target, max_step)
-        leap_hand.set_leap(pos)
+        _resilient_call(leap_hand, leap_hand.set_leap, pos)
         time.sleep(control_period_s)
 
     leap_hand.dxl_client.set_torque_enabled(THUMB_MOTORS, False)
@@ -216,17 +278,25 @@ def capture_thumb_pose(leap_hand, duration_s, control_hz=20):
         t0 = time.time()
         while duration_s <= 0 or time.time() - t0 < duration_s:
             pos[0:12] = target[0:12]  # keep Index/Middle/Ring held in stance
-            leap_hand.set_leap(pos)
+            _resilient_call(leap_hand, leap_hand.set_leap, pos)
             now = time.time()
             if now - last_print >= 1.0:
-                current_real = leap_hand.read_pos()
-                current_allegro_deg = np.degrees(lhu.LEAPhand_to_allegro(current_real, zeros=False))
-                thumb_deg = current_allegro_deg[12:16]
-                print(f"Thumb pose (deg): Side={thumb_deg[0]:.1f}  Forward={thumb_deg[1]:.1f}  "
-                      f"PIP={thumb_deg[2]:.1f}  DIP={thumb_deg[3]:.1f}")
+                current_real = _resilient_call(leap_hand, leap_hand.read_pos)
+                if current_real is not None:
+                    current_allegro_deg = np.degrees(lhu.LEAPhand_to_allegro(current_real, zeros=False))
+                    thumb_deg = current_allegro_deg[12:16]
+                    print(f"Thumb pose (deg): Side={thumb_deg[0]:.1f}  Forward={thumb_deg[1]:.1f}  "
+                          f"PIP={thumb_deg[2]:.1f}  DIP={thumb_deg[3]:.1f}")
                 last_print = now
             time.sleep(control_period_s)
     finally:
+        # Snap the commanded thumb target to wherever it's actually resting right now
+        # before re-enabling torque, so it holds that pose instead of jumping toward the
+        # stale pre-disable target still sitting in pos[12:16].
+        current_real = _resilient_call(leap_hand, leap_hand.read_pos)
+        if current_real is not None:
+            pos[12:16] = current_real[12:16]
+            _resilient_call(leap_hand, leap_hand.set_leap, pos)
         leap_hand.dxl_client.set_torque_enabled(THUMB_MOTORS, True)
         print("Thumb torque re-enabled.")
 
@@ -249,6 +319,10 @@ if __name__ == "__main__":
                              "the simultaneous propulsive force.")
     parser.add_argument("--reverse", action="store_true",
                         help="In --mode walk, drive the hand backward instead of forward.")
+    parser.add_argument("--free-thumb", action="store_true",
+                        help="In --mode walk, disable thumb torque for the whole walk so you can feel out a "
+                             "support pose by hand while Index/Middle/Ring are actually walking (re-enabled "
+                             "automatically when the walk ends).")
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Seconds to hold the pose in --mode thumb-pose, or to print in --mode thumb-capture "
                              "(0 = until Ctrl-C).")
@@ -271,6 +345,7 @@ if __name__ == "__main__":
         elif args.mode == "thumb-capture":
             capture_thumb_pose(leap_hand, args.duration)
         else:
-            run(leap_hand, args.cycle_period, args.cycles, synchronized=args.sync, reverse=args.reverse)
+            run(leap_hand, args.cycle_period, args.cycles, synchronized=args.sync, reverse=args.reverse,
+                free_thumb=args.free_thumb)
     except KeyboardInterrupt:
         pass
