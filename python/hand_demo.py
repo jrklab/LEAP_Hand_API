@@ -114,6 +114,37 @@ class LeapNode:
     #These combined commands are faster FYI and return a list of data
     def pos_vel_eff_srv(self):
         return self.dxl_client.read_pos_vel_cur()
+
+    def recover_stalled_motors(self, motor_ids, reboot_if_needed=True):
+        """Check the given motors for torque that the firmware auto-disabled on its own
+        (e.g. an Overload trip from a mechanical clash against another finger) and try to
+        recover them, instead of leaving that motor dead until the whole script restarts.
+
+        First tries a plain re-enable (works if the physical clash has already cleared --
+        many firmware versions drop the latched error once the triggering condition is
+        gone and torque is requested again). If that doesn't take, reboots just the
+        still-stalled motors and re-applies this node's PID gains/current limit to them
+        (reboot resets a motor's RAM-area settings to firmware defaults, including those).
+        Returns the list of motor IDs that were found stalled (recovered or not)."""
+        torque_state = self.dxl_client.get_torque_enabled(motor_ids)
+        stalled = [mid for mid, enabled in torque_state.items() if not enabled]
+        if not stalled:
+            return []
+        error_status = self.dxl_client.get_hardware_error_status(stalled)
+        print(f"Detected stalled motor(s) (torque auto-disabled): {stalled}, "
+              f"hardware error status: {error_status}")
+        self.dxl_client.set_torque_enabled(stalled, True, retries=2)
+        still_stalled = [mid for mid, enabled in self.dxl_client.get_torque_enabled(stalled).items() if not enabled]
+        if still_stalled and reboot_if_needed:
+            print(f"Plain re-enable didn't clear it for {still_stalled}, rebooting...")
+            self.dxl_client.reboot(still_stalled)
+            time.sleep(0.5)  # let the reboot complete before touching the motor again
+            self.dxl_client.sync_write(still_stalled, np.ones(len(still_stalled)) * self.kP, 84, 2)
+            self.dxl_client.sync_write(still_stalled, np.ones(len(still_stalled)) * self.kI, 82, 2)
+            self.dxl_client.sync_write(still_stalled, np.ones(len(still_stalled)) * self.kD, 80, 2)
+            self.dxl_client.sync_write(still_stalled, np.ones(len(still_stalled)) * self.curr_lim, 102, 2)
+            self.dxl_client.set_torque_enabled(still_stalled, True, retries=2)
+        return stalled
 #init the node
 def main(mode = "realtime", **kwargs):
     # valid_motors = [8, 9, 10, 11]
@@ -200,8 +231,21 @@ def main(mode = "realtime", **kwargs):
         # to feel laggy for real gesture motion, but enough to absorb an isolated noisy or
         # garbled packet instead of jerking the motor straight to it.
         MAX_SLEW_RAD_PER_S = np.deg2rad(400)
-        max_step = MAX_SLEW_RAD_PER_S * CONTROL_PERIOD_S
+        # The thumb's Forward/PIP/DIP motors (13/14/15 -- Side/12 isn't driven in realtime
+        # mode at all, see udp_listener below) have tripped Overload (the Dynamixel
+        # firmware's own protective torque cutoff, triggered by sustained high current)
+        # after calibration. A lower slew cap just on these three reduces how hard the
+        # position-current controller has to work to chase a fast-changing tracked target.
+        # Starting point, not verified against a specific duty-cycle spec -- tune down
+        # further if Overload still trips, or up if the thumb now feels too sluggish.
+        THUMB_MAX_SLEW_RAD_PER_S = np.deg2rad(120)
+        max_step = np.full(16, MAX_SLEW_RAD_PER_S) * CONTROL_PERIOD_S
+        max_step[[13, 14, 15]] = THUMB_MAX_SLEW_RAD_PER_S * CONTROL_PERIOD_S
         PRINT_EVERY_N_LOOPS = 100  # ~once/second at this mode's 100Hz loop rate
+        # How often to check for a motor the firmware auto-disabled (e.g. an Overload
+        # trip from a finger clash) and try to recover it -- not every tick, since each
+        # check is a handful of individual register reads across all 16 motors.
+        FAULT_CHECK_EVERY_N_LOOPS = 100  # ~once/second
 
     loop_count = 0
     while True:
@@ -209,8 +253,15 @@ def main(mode = "realtime", **kwargs):
         # Status prints are throttled so the console stays readable instead of printing
         # every single cycle.
         verbose = (loop_count % PRINT_EVERY_N_LOOPS == 0)
-        #Set to an open pose and read the joint angles 33hz
-        leap_hand.set_allegro(pos)
+        # Clip to real joint limits before sending -- previously ungarded here (set_allegro
+        # doesn't clip), so a miscalibrated or out-of-range tracked angle (particularly a
+        # thumb joint, whose per-session calibrated motor-degree window in
+        # hand_joint_tracker.py can map wider than the joint's real physical range) could
+        # command the motor to strain continuously against its mechanical limit under
+        # active position-current control -- itself a plausible cause of an Overload trip,
+        # independent of how fast it got there.
+        target_real = lhu.angle_safety_clip(lhu.allegro_to_LEAPhand(pos, zeros=False))
+        leap_hand.set_leap(target_real)
         if verbose:
             print("Desired Position: " + str(pos[valid_motors]))
             print("Read Position: " + str(leap_hand.read_pos()))
@@ -222,6 +273,8 @@ def main(mode = "realtime", **kwargs):
             pos[valid_motors] += angle_step
             time.sleep(0.03)
         elif mode == "realtime":
+            if loop_count % FAULT_CHECK_EVERY_N_LOOPS == 0:
+                leap_hand.recover_stalled_motors(valid_motors)
             with target_lock:
                 target = target_pos.copy()
             pos = slew_limit(pos, target, max_step)

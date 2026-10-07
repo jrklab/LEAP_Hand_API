@@ -18,6 +18,12 @@ DEVICE_NAME = '/dev/ttyUSB0'
 # ### NEW ### XL330-M288 Control Table Addresses
 ADDR_TORQUE_ENABLE      = 64
 ADDR_LED                = 65
+# Firmware auto-disables ADDR_TORQUE_ENABLE and latches a bit here when it detects a
+# fault (bit 5 = Overload -- sustained high current, e.g. from a mechanical clash
+# against another finger; bit 4 = Electrical Shock; bit 3 = Encoder; bit 2 =
+# Overheating; bit 0 = Input Voltage). See DynamixelClient.get_hardware_error_status /
+# recover_stalled_motors below.
+ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_POSITION_D_GAIN    = 80
 ADDR_POSITION_I_GAIN    = 82
 ADDR_POSITION_P_GAIN    = 84
@@ -139,6 +145,41 @@ class DynamixelClient:
                 )
                 if result == dynamixel_sdk.COMM_SUCCESS:
                     break
+
+    def get_torque_enabled(self, motor_ids):
+        """Returns {motor_id: bool}, read fresh from each motor rather than tracked in
+        software -- the firmware can flip this to False on its own (see
+        ADDR_HARDWARE_ERROR_STATUS above), independent of anything this class commanded.
+        A motor whose read fails entirely (e.g. a bus glitch) is omitted rather than
+        guessed at."""
+        result = {}
+        for motor_id in motor_ids:
+            val, comm_result, _error = self.packet_handler.read1ByteTxRx(
+                self.port_handler, motor_id, ADDR_TORQUE_ENABLE
+            )
+            if comm_result == dynamixel_sdk.COMM_SUCCESS:
+                result[motor_id] = bool(val)
+        return result
+
+    def get_hardware_error_status(self, motor_ids):
+        """Returns {motor_id: raw_byte} of ADDR_HARDWARE_ERROR_STATUS -- for diagnosing
+        *why* a motor's torque was auto-disabled, not just that it was."""
+        result = {}
+        for motor_id in motor_ids:
+            val, comm_result, _error = self.packet_handler.read1ByteTxRx(
+                self.port_handler, motor_id, ADDR_HARDWARE_ERROR_STATUS
+            )
+            if comm_result == dynamixel_sdk.COMM_SUCCESS:
+                result[motor_id] = val
+        return result
+
+    def reboot(self, motor_ids):
+        """Reboots the given motors -- clears a latched hardware error that a plain
+        Torque_Enable re-write sometimes won't clear on its own. This resets that motor's
+        RAM-area settings (PID gains, current limit, goal position, torque enable) to
+        firmware defaults; callers must re-apply those (and re-enable torque) afterward."""
+        for motor_id in motor_ids:
+            self.packet_handler.reboot(self.port_handler, motor_id)
 
     def write_desired_pos(self, motor_ids, radian_positions):
         ticks = _radians_to_ticks(radian_positions)
