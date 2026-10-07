@@ -253,18 +253,36 @@ def main(mode = "realtime", **kwargs):
         # Status prints are throttled so the console stays readable instead of printing
         # every single cycle.
         verbose = (loop_count % PRINT_EVERY_N_LOOPS == 0)
-        # Clip to real joint limits before sending -- previously ungarded here (set_allegro
-        # doesn't clip), so a miscalibrated or out-of-range tracked angle (particularly a
-        # thumb joint, whose per-session calibrated motor-degree window in
-        # hand_joint_tracker.py can map wider than the joint's real physical range) could
-        # command the motor to strain continuously against its mechanical limit under
-        # active position-current control -- itself a plausible cause of an Overload trip,
-        # independent of how fast it got there.
-        target_real = lhu.angle_safety_clip(lhu.allegro_to_LEAPhand(pos, zeros=False))
-        leap_hand.set_leap(target_real)
-        if verbose:
-            print("Desired Position: " + str(pos[valid_motors]))
-            print("Read Position: " + str(leap_hand.read_pos()))
+        try:
+            # Clip to real joint limits before sending -- previously ungarded here
+            # (set_allegro doesn't clip), so a miscalibrated or out-of-range tracked angle
+            # (particularly a thumb joint, whose per-session calibrated motor-degree
+            # window in hand_joint_tracker.py can map wider than the joint's real
+            # physical range) could command the motor to strain continuously against its
+            # mechanical limit under active position-current control -- itself a
+            # plausible cause of an Overload trip, independent of how fast it got there.
+            target_real = lhu.angle_safety_clip(lhu.allegro_to_LEAPhand(pos, zeros=False))
+            leap_hand.set_leap(target_real)
+            if verbose:
+                print("Desired Position: " + str(pos[valid_motors]))
+                print("Read Position: " + str(leap_hand.read_pos()))
+            if mode == "realtime" and loop_count % FAULT_CHECK_EVERY_N_LOOPS == 0:
+                leap_hand.recover_stalled_motors(valid_motors)
+        except Exception as e:
+            # A transient USB/serial hiccup (seen in practice as a termios.error:
+            # Input/output error raised deep inside the Dynamixel SDK's txPacket)
+            # previously crashed the whole script, losing all state and requiring a full
+            # restart. Reconnect the port and keep going instead -- motor-side state
+            # (gains, current limit, torque enable) lives on the motors themselves and
+            # survives a port-level reconnect, unlike a motor reboot.
+            print(f"Communication error ({e!r}) -- attempting to reconnect...")
+            try:
+                leap_hand.dxl_client.reconnect()
+                print("Reconnected.")
+            except Exception as reconnect_error:
+                print(f"Reconnect failed ({reconnect_error!r}), will retry next cycle.")
+            time.sleep(0.5)
+            continue
         if mode == "test":
             if pos[valid_motors[0]] <= min_angle:
                 angle_step = step
@@ -273,8 +291,6 @@ def main(mode = "realtime", **kwargs):
             pos[valid_motors] += angle_step
             time.sleep(0.03)
         elif mode == "realtime":
-            if loop_count % FAULT_CHECK_EVERY_N_LOOPS == 0:
-                leap_hand.recover_stalled_motors(valid_motors)
             with target_lock:
                 target = target_pos.copy()
             pos = slew_limit(pos, target, max_step)

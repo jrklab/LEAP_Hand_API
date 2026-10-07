@@ -110,6 +110,26 @@ class DynamixelClient:
     def disconnect(self):
         self.port_handler.closePort()
 
+    def reconnect(self):
+        """Close and reopen the serial port -- recovers from a dead/glitched file
+        descriptor (seen in practice as a termios.error: Input/output error raised deep
+        inside a sync write/read) without restarting the whole process. Motor-side state
+        (PID gains, current limit, torque enable, Homing_Offset) lives on the motors
+        themselves and survives this -- unlike DynamixelClient.reboot(), which resets it."""
+        try:
+            self.port_handler.closePort()
+        except Exception:
+            pass
+        # protocol2_packet_handler.txPacket() sets port.is_using=True before writing,
+        # then calls port.clearPort() (the exact call that raises the termios.error this
+        # reconnect is recovering from) -- if that raises, is_using is only ever reset to
+        # False on the *normal* return path, so it's left stuck True forever. Every future
+        # transaction then fails immediately with "Port is in use!", even on an otherwise
+        # fully working reconnected port, unless we clear it ourselves here.
+        self.port_handler.is_using = False
+        time.sleep(0.2)
+        self.connect()
+
     @staticmethod
     def _int_to_bytes(value, size):
         value = int(value) & (0xFFFFFFFF if size == 4 else 0xFFFF if size == 2 else 0xFF)
@@ -186,7 +206,9 @@ class DynamixelClient:
         self._write_pos_group.clearParam()
         for motor_id, tick in zip(motor_ids, ticks):
             self._write_pos_group.addParam(motor_id, self._int_to_bytes(tick, LEN_GOAL_POSITION))
-        self._write_pos_group.txPacket()
+        result = self._write_pos_group.txPacket()
+        if result != dynamixel_sdk.COMM_SUCCESS:
+            raise RuntimeError(f"Sync write failed: {self.packet_handler.getTxRxResult(result)}")
 
     def _sync_read_raw(self, motor_ids, address, size, group=None):
         owns_group = group is None
@@ -194,7 +216,20 @@ class DynamixelClient:
             group = dynamixel_sdk.GroupSyncRead(self.port_handler, self.packet_handler, address, size)
             for motor_id in motor_ids:
                 group.addParam(motor_id)
-        group.txRxPacket()
+        result = group.txRxPacket()
+        if result != dynamixel_sdk.COMM_SUCCESS:
+            # Don't trust group.getData()'s own availability check here: GroupSyncRead's
+            # internal `last_result` flag is only updated inside rxPacket(), which
+            # txRxPacket() skips entirely if the TX half fails -- so after a TX failure
+            # (plausible right after a fresh port reconnect) last_result stays stuck at
+            # True from the last *successful* read, long before this one. getData() then
+            # trusts that stale flag and indexes into an empty data buffer, raising a
+            # confusing IndexError instead of a clean, catchable communication failure.
+            if owns_group:
+                group.clearParam()
+            raise RuntimeError(
+                f"Sync read failed (address={address}): {self.packet_handler.getTxRxResult(result)}"
+            )
         values = []
         for motor_id in motor_ids:
             raw = group.getData(motor_id, address, size)
