@@ -135,6 +135,12 @@ python hand_demo.py --mode test        # triangle wave on all 16 motors, no came
 python hand_demo.py --mode realtime    # live control from hand_joint_tracker.py's UDP feed
 ```
 
+Both scripts here and `leap_hand_walk.py` take `--port PORT` to pick the hand's serial port
+explicitly, e.g. `--port /dev/ttyACM0`, a `/dev/serial/by-id/...` path, or a Cereb wireless
+bridge PTY such as `--port /tmp/cereb/leader-65E0`. Without it, `LeapNode` auto-searches
+`/dev/ttyUSB0`, `/dev/ttyUSB1`, `/dev/ttyACM0`, then `COM13`, and a hand on any other port is
+never found.
+
 `--mode test` is the quick "did my wiring/calibration survive" smoke test — always try
 this before `realtime` after any hardware change. `--mode realtime` listens on UDP
 `0.0.0.0:5005` for packets from `hand_joint_tracker.py` (§4) and must be run alongside it.
@@ -312,6 +318,7 @@ python leap_hand_walk.py --mode single-leg --finger Index --cycle-period 3.0 --c
 # Full gait once single-leg checks out for all three fingers:
 python leap_hand_walk.py --mode walk --cycle-period 3.0 --cycles 4
 python leap_hand_walk.py --mode walk --sync --cycle-period 3.0 --cycles 4   # synchronized
+python leap_hand_walk.py --mode walk --sync --port /tmp/cereb/leader-65E0   # pick the port
 python leap_hand_walk.py --mode walk --reverse --cycle-period 3.0 --cycles 4 # backward
 
 # Thumb pose tools:

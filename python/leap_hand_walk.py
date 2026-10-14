@@ -323,6 +323,10 @@ if __name__ == "__main__":
                         help="In --mode walk, disable thumb torque for the whole walk so you can feel out a "
                              "support pose by hand while Index/Middle/Ring are actually walking (re-enabled "
                              "automatically when the walk ends).")
+    parser.add_argument("--port", default=None,
+                        help="Serial port of the hand (e.g. /dev/ttyACM0, or a Cereb wireless bridge "
+                             "PTY like /tmp/cereb/leader-65E0). Default: hand_demo.LeapNode's "
+                             "auto-search (/dev/ttyUSB0, /dev/ttyUSB1, /dev/ttyACM0, COM13).")
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Seconds to hold the pose in --mode thumb-pose, or to print in --mode thumb-capture "
                              "(0 = until Ctrl-C).")
@@ -336,7 +340,7 @@ if __name__ == "__main__":
     # the process is asked to stop.
     signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
 
-    leap_hand = LeapNode(motors=list(range(16)))
+    leap_hand = LeapNode(motors=list(range(16)), port=args.port)
     try:
         if args.mode == "single-leg":
             run_single_leg(leap_hand, args.finger, args.cycle_period, args.cycles)

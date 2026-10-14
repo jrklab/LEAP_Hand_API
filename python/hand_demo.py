@@ -33,7 +33,10 @@ def slew_limit(current, target, max_step):
     return current + delta
 
 class LeapNode:
-    def __init__(self, motors=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]):
+    def __init__(self, motors=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15], port=None):
+        """port: serial port of the hand, e.g. /dev/ttyACM0, a /dev/serial/by-id/... path, or a
+        Cereb wireless bridge PTY such as /tmp/cereb/leader-65E0. None auto-searches
+        /dev/ttyUSB0, /dev/ttyUSB1, /dev/ttyACM0, then COM13."""
         ####Some parameters
         # I recommend you keep the current limit from 350 for the lite, and 550 for the full hand
         # Increase KP if the hand is too weak, decrease if it's jittery.
@@ -52,16 +55,15 @@ class LeapNode:
         self.prev_pos = self.pos = self.curr_pos = init_pos[self.motors]
         print(f"Using motors ID: {self.motors}")
         baud_rate = 4000000 # default baud rate was 4000000, but 1000000 is more stable for my system
-        try:
-            self.dxl_client = DynamixelClient(motors, '/dev/ttyUSB0', baud_rate)
-            self.dxl_client.connect()
-        except Exception:
+        ports = [port] if port is not None else ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', 'COM13']
+        for i, candidate in enumerate(ports):
             try:
-                self.dxl_client = DynamixelClient(motors, '/dev/ttyUSB1', baud_rate)
+                self.dxl_client = DynamixelClient(motors, candidate, baud_rate)
                 self.dxl_client.connect()
-            except Exception:
-                self.dxl_client = DynamixelClient(motors, 'COM13', baud_rate)
-                self.dxl_client.connect()
+                break
+            except Exception as e:
+                if i == len(ports) - 1:
+                    raise RuntimeError(f"Could not connect to the LEAP Hand on {', '.join(ports)}: {e}") from e
         #Enables position-current control mode and the default parameters, it commands a position and then caps the current so the motors don't overload
         self.dxl_client.sync_write(motors, np.ones(len(motors))*5, 11, 1)
         self.dxl_client.set_torque_enabled(motors, True, retries=3)
@@ -146,11 +148,11 @@ class LeapNode:
             self.dxl_client.set_torque_enabled(still_stalled, True, retries=2)
         return stalled
 #init the node
-def main(mode = "realtime", **kwargs):
+def main(mode = "realtime", port=None, **kwargs):
     # valid_motors = [8, 9, 10, 11]
     # valid_motors = [0, 1, 2, 3, 12, 13, 14, 15] # index and thumb
     valid_motors = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # all motors
-    leap_hand = LeapNode(motors=valid_motors)
+    leap_hand = LeapNode(motors=valid_motors, port=port)
     pos = np.zeros(16)  # Initialize position array for valid motors
     if mode == "test": # run a fixed triangle wave on all motors
         step = np.deg2rad(1)
@@ -301,7 +303,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Leap Hand Control Script")
     parser.add_argument("--mode", choices=["test", "realtime"], default="realtime",
                         help="Select operation mode: 'test' for triangle wave, 'realtime' for live UDP control")
+    parser.add_argument("--port", default=None,
+                        help="Serial port of the hand (e.g. /dev/ttyACM0, or a Cereb wireless bridge "
+                             "PTY like /tmp/cereb/leader-65E0). Default: auto-search /dev/ttyUSB0, "
+                             "/dev/ttyUSB1, /dev/ttyACM0, COM13.")
 
     args = parser.parse_args()
 
-    main(mode=args.mode)
+    main(mode=args.mode, port=args.port)
