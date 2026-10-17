@@ -64,6 +64,17 @@ def _radians_to_ticks(radians):
     return np.round(np.asarray(radians, dtype=np.float64) * (RESOLUTION / (2 * np.pi))).astype(np.int64)
 
 
+class ReadTimeout(RuntimeError):
+    """A read got no complete reply, even after retrying. Usually transient (a reply lost or
+    cut short on the bus, or late over a wireless link): skip this cycle and carry on. Unlike
+    a port-level error (OSError/termios), it doesn't call for reconnecting the port."""
+
+
+# Extra attempts for a read that got no complete reply. Through a Cereb wireless node about 1 in
+# 1,000 sixteen-motor reads fails once; a retry almost always gets it.
+READ_RETRIES = 2
+
+
 class DynamixelClient:
     """Restores the interface hand_demo.py and main.py expect: DynamixelClient(motor_ids,
     port, baudrate), .connect(), .sync_write(motor_ids, values, address, size),
@@ -86,6 +97,7 @@ class DynamixelClient:
     """
 
     def __init__(self, motor_ids, port=DEVICE_NAME, baudrate=BAUDRATE):
+        self.read_retries = 0  # reads that needed another attempt (see _sync_read_raw)
         self.motor_ids = list(motor_ids)
         self.port_handler = dynamixel_sdk.PortHandler(port)
         self.packet_handler = dynamixel_sdk.PacketHandler(PROTOCOL_VERSION)
@@ -216,7 +228,20 @@ class DynamixelClient:
             group = dynamixel_sdk.GroupSyncRead(self.port_handler, self.packet_handler, address, size)
             for motor_id in motor_ids:
                 group.addParam(motor_id)
-        result = group.txRxPacket()
+        for attempt in range(READ_RETRIES + 1):
+            result = group.txRxPacket()
+            # Success also needs every motor's data in hand: right after a failed attempt, the
+            # SDK can report success with some motors' data still empty (a late reply to the
+            # earlier attempt mixed in), and getData() would then raise IndexError.
+            if result == dynamixel_sdk.COMM_SUCCESS and all(
+                    len(group.data_dict.get(motor_id) or []) >= size for motor_id in motor_ids):
+                break
+            if result == dynamixel_sdk.COMM_SUCCESS:
+                result = dynamixel_sdk.COMM_RX_CORRUPT
+            self.read_retries += 1
+            # Let a late reply to this attempt arrive, then drop it, before resending.
+            time.sleep(0.03)
+            self.port_handler.clearPort()
         if result != dynamixel_sdk.COMM_SUCCESS:
             # Don't trust group.getData()'s own availability check here: GroupSyncRead's
             # internal `last_result` flag is only updated inside rxPacket(), which
@@ -227,8 +252,9 @@ class DynamixelClient:
             # confusing IndexError instead of a clean, catchable communication failure.
             if owns_group:
                 group.clearParam()
-            raise RuntimeError(
-                f"Sync read failed (address={address}): {self.packet_handler.getTxRxResult(result)}"
+            raise ReadTimeout(
+                f"Sync read failed (address={address}) after {READ_RETRIES + 1} attempts: "
+                f"{self.packet_handler.getTxRxResult(result)}"
             )
         values = []
         for motor_id in motor_ids:

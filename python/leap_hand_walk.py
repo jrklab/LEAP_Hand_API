@@ -43,6 +43,7 @@ import numpy as np
 
 import leap_hand_utils.leap_hand_utils as lhu
 from hand_demo import LeapNode, slew_limit
+from leap_hand_utils.dynamixel_client import ReadTimeout
 
 LEG_FINGER_SLICES = {
     'Index': slice(0, 4),
@@ -133,9 +134,16 @@ def _resilient_call(leap_hand, fn, *args, **kwargs):
     RuntimeError/termios-style error from deep inside a sync read/write -- see
     DynamixelClient.reconnect()'s docstring), reconnect the port and retry once instead of
     crashing the whole script. Returns None if the retry also fails -- callers should
-    treat that as "skip this cycle", not a terminal error."""
+    treat that as "skip this cycle", not a terminal error. A ReadTimeout (a read with no
+    complete reply after DynamixelClient's retries) returns None straight away: the port
+    itself is fine, so reconnecting would only add delay."""
     try:
         return fn(*args, **kwargs)
+    except ReadTimeout as e:
+        # No complete reply even after DynamixelClient's own retries -- transient, and the port
+        # is fine, so skip this cycle without the slow reconnect.
+        print(f"Read failed ({e}) -- skipping this cycle.")
+        return None
     except Exception as e:
         print(f"Communication error ({e!r}) -- attempting to reconnect...")
         try:

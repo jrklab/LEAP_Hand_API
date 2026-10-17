@@ -74,7 +74,16 @@ class LeapNode:
         self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kD * 0.75), 80, 2) # Dgain damping for side to side should be a bit less
         #Max at current (in unit 1ma) so don't overheat and grip too hard #500 normal or #350 for lite
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.curr_lim, 102, 2)
-        self.curr_pos = self.read_pos()
+        # A read through a wireless link occasionally fails (DynamixelClient retries it, and
+        # raises ReadTimeout only if every attempt failed); don't give up on the hand for that.
+        for attempt in range(5):
+            try:
+                self.curr_pos = self.read_pos()
+                break
+            except ReadTimeout as e:
+                if attempt == 4:
+                    raise RuntimeError(f"The LEAP Hand on {candidate} isn't answering position reads: {e}") from e
+                time.sleep(0.2)
         # print current position
         print(f"Initial Position: {self.curr_pos}")
         angle_per_step = (init_pos[self.motors] - self.curr_pos)/init_steps
@@ -270,6 +279,11 @@ def main(mode = "realtime", port=None, **kwargs):
                 print("Read Position: " + str(leap_hand.read_pos()))
             if mode == "realtime" and loop_count % FAULT_CHECK_EVERY_N_LOOPS == 0:
                 leap_hand.recover_stalled_motors(valid_motors)
+        except ReadTimeout as e:
+            # A read with no complete reply even after DynamixelClient's retries: transient
+            # (lost or late on the bus or the wireless link). The port is fine, so no reconnect
+            # or pause -- just carry on with the next cycle.
+            print(f"Read failed ({e}) -- skipping this cycle.")
         except Exception as e:
             # A transient USB/serial hiccup (seen in practice as a termios.error:
             # Input/output error raised deep inside the Dynamixel SDK's txPacket)
